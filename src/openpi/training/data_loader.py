@@ -1,7 +1,9 @@
+import dataclasses
 from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
 import os
+import sys
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
@@ -62,7 +64,100 @@ class TransformedDataset(Dataset[T_co]):
         return len(self._dataset)
 
 
-class IterableTransformedDataset(IterableDataset[T_co]):
+@dataclasses.dataclass(frozen=True)
+class _EpisodeStreamMeta:
+    episode_id: int
+    start: int
+    end: int
+
+    @property
+    def num_frames(self) -> int:
+        return self.end - self.start
+
+
+class EpisodeStreamIterableDataset(torch.utils.data.IterableDataset):
+    """Stream complete episodes sequentially with rank/worker-local ownership."""
+
+    def __init__(
+        self,
+        dataset: Dataset[dict],
+        episode_ranges: Sequence[tuple[int, int]],
+        *,
+        num_replicas: int = 1,
+        rank: int = 0,
+        seed: int = 0,
+        infinite: bool = True,
+    ):
+        if num_replicas <= 0:
+            raise ValueError(f"num_replicas must be > 0, got {num_replicas}")
+        if rank < 0 or rank >= num_replicas:
+            raise ValueError(f"rank must be in [0, {num_replicas}), got {rank}")
+
+        self._dataset = dataset
+        self._seed = int(seed)
+        self._infinite = bool(infinite)
+
+        episodes: list[_EpisodeStreamMeta] = []
+        num_frames = 0
+        for episode_id, (start, end) in enumerate(episode_ranges):
+            if end <= start:
+                continue
+            if episode_id % num_replicas != rank:
+                continue
+            episode = _EpisodeStreamMeta(episode_id=episode_id, start=int(start), end=int(end))
+            episodes.append(episode)
+            num_frames += episode.num_frames
+
+        self._episodes = episodes
+        self._num_frames = num_frames
+
+    def __len__(self) -> int:
+        if self._infinite:
+            return min(max(self._num_frames, 1) * 10000, sys.maxsize // 2)
+        return self._num_frames
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        worker_rng = np.random.RandomState(self._seed)
+
+        if worker_info is None:
+            worker_episodes = self._episodes
+            stream_id = 0
+        else:
+            worker_id = int(worker_info.id)
+            num_workers = int(worker_info.num_workers)
+            num_episodes = len(self._episodes)
+            episodes_per_worker = num_episodes // num_workers
+            remainder = num_episodes % num_workers
+            start_idx = worker_id * episodes_per_worker + min(worker_id, remainder)
+            end_idx = start_idx + episodes_per_worker + (1 if worker_id < remainder else 0)
+            worker_episodes = self._episodes[start_idx:end_idx]
+            stream_id = worker_id
+
+        if not worker_episodes:
+            return iter(())
+
+        def _gen():
+            while True:
+                cycle_episodes = list(worker_episodes)
+                if self._infinite:
+                    worker_rng.shuffle(cycle_episodes)
+
+                for episode in cycle_episodes:
+                    for episode_pos, frame_index in enumerate(range(episode.start, episode.end)):
+                        sample = dict(self._dataset[int(frame_index)])
+                        sample["episode_id"] = np.int64(episode.episode_id)
+                        sample["episode_pos"] = np.int64(episode_pos)
+                        sample["stream_id"] = np.int64(stream_id)
+                        yield sample
+
+                if not self._infinite:
+                    break
+
+        return _gen()
+
+
+class IterableTransformedDataset(torch.utils.data.IterableDataset):
     def __init__(
         self,
         dataset: IterableDataset,
@@ -149,6 +244,30 @@ def create_torch_dataset(
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
     return dataset
+
+
+def _extract_episode_ranges(dataset: Dataset) -> list[tuple[int, int]]:
+    """Extract LeRobot episode boundaries as half-open frame ranges."""
+    source = dataset
+    while isinstance(source, TransformedDataset):
+        source = source._dataset  # noqa: SLF001
+
+    episode_data_index = getattr(source, "episode_data_index", None)
+    if episode_data_index is None:
+        return [(0, len(source))]
+
+    starts = episode_data_index["from"]
+    ends = episode_data_index["to"]
+    if hasattr(starts, "detach"):
+        starts = starts.detach().cpu().numpy()
+    if hasattr(ends, "detach"):
+        ends = ends.detach().cpu().numpy()
+
+    starts = np.asarray(starts, dtype=np.int64)
+    ends = np.asarray(ends, dtype=np.int64)
+    if starts.shape != ends.shape:
+        raise ValueError(f"episode_data_index has mismatched shapes: {starts.shape=} {ends.shape=}")
+    return [(int(start), int(end)) for start, end in zip(starts.tolist(), ends.tolist(), strict=True)]
 
 
 def create_rlds_dataset(
@@ -299,15 +418,32 @@ def create_torch_data_loader(
             execute in the main process.
         seed: The seed to use for shuffling the data.
     """
-    dataset = create_torch_dataset(data_config, action_horizon, model_config)
-    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    raw_dataset = create_torch_dataset(data_config, action_horizon, model_config)
+    use_episode_stream = data_config.use_episode_stream and framework == "pytorch"
+    if use_episode_stream:
+        num_replicas = 1
+        rank = 0
+        if torch.distributed.is_initialized():
+            num_replicas = torch.distributed.get_world_size()
+            rank = torch.distributed.get_rank()
+        dataset = EpisodeStreamIterableDataset(
+            raw_dataset,
+            _extract_episode_ranges(raw_dataset),
+            num_replicas=num_replicas,
+            rank=rank,
+            seed=seed,
+            infinite=True,
+        )
+        dataset = transform_iterable_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    else:
+        dataset = transform_dataset(raw_dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     # Use TorchDataLoader for both frameworks
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size
     # For JAX, divide by process count
     sampler = None
     if framework == "pytorch":
-        if torch.distributed.is_initialized():
+        if torch.distributed.is_initialized() and not use_episode_stream:
             sampler = torch.utils.data.distributed.DistributedSampler(
                 dataset,
                 num_replicas=torch.distributed.get_world_size(),
@@ -317,7 +453,8 @@ def create_torch_data_loader(
             )
             local_batch_size = batch_size // torch.distributed.get_world_size()
         else:
-            local_batch_size = batch_size
+            world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            local_batch_size = batch_size // world_size
     else:
         local_batch_size = batch_size // jax.process_count()
 
@@ -412,8 +549,12 @@ class TorchDataLoader:
         if jax.process_count() > 1:
             raise NotImplementedError("Data loading with multiple processes is not supported.")
 
+        is_iterable_dataset = isinstance(dataset, torch.utils.data.IterableDataset)
+
         if len(dataset) < local_batch_size:
             raise ValueError(f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
+        if is_iterable_dataset and sampler is not None:
+            raise ValueError("Iterable datasets cannot be used with an explicit sampler.")
 
         # Store sharding - None for PyTorch, JAX sharding for JAX
         self._sharding = sharding
@@ -434,7 +575,7 @@ class TorchDataLoader:
         self._data_loader = torch.utils.data.DataLoader(
             typing.cast(torch.utils.data.Dataset, dataset),
             batch_size=local_batch_size,
-            shuffle=(sampler is None and shuffle),  # Don't shuffle if using sampler
+            shuffle=(sampler is None and shuffle and not is_iterable_dataset),  # Don't shuffle iterable streams.
             sampler=sampler,
             num_workers=num_workers,
             multiprocessing_context=mp_context,
