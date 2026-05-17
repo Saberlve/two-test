@@ -115,3 +115,35 @@ class Pi0Config(_model.BaseModelConfig):
         if not filters:
             return nnx.Nothing
         return nnx.All(*filters)
+
+
+@dataclasses.dataclass(frozen=True)
+class Pi0RMTContextConfig(Pi0Config):
+    """PyTorch-only PI0/PI05 config with recurrent memory transformer context."""
+
+    max_recur_steps: int = 1
+    mini_batch_size: int = 8
+    budget: int = 8
+    token_per_image: int = 8
+    memory_hidden_dim: int = 256
+    num_attn_heads: int = 8
+    num_kv_heads: int = 1
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.max_recur_steps < 1:
+            raise ValueError(f"max_recur_steps must be >= 1, got {self.max_recur_steps}")
+        if self.mini_batch_size < 1:
+            raise ValueError(f"mini_batch_size must be >= 1, got {self.mini_batch_size}")
+        if self.budget < 1:
+            raise ValueError(f"budget must be >= 1, got {self.budget}")
+        if self.token_per_image < 1:
+            raise ValueError(f"token_per_image must be >= 1, got {self.token_per_image}")
+        if self.memory_hidden_dim < 1:
+            raise ValueError(f"memory_hidden_dim must be >= 1, got {self.memory_hidden_dim}")
+        if self.num_attn_heads < 1 or self.memory_hidden_dim % self.num_attn_heads != 0:
+            raise ValueError("num_attn_heads must divide memory_hidden_dim")
+        if self.num_kv_heads < 1:
+            raise ValueError(f"num_kv_heads must be >= 1, got {self.num_kv_heads}")
+        if self.num_attn_heads % self.num_kv_heads != 0:
+            raise ValueError("num_kv_heads must divide num_attn_heads")

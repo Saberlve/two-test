@@ -90,6 +90,9 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # If true, PyTorch training uses episode-local sequential streaming instead of random frame sampling.
+    use_episode_stream: bool = False
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -206,7 +209,7 @@ class FakeDataConfig(DataConfigFactory):
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        return DataConfig(repo_id=self.repo_id)
+        return dataclasses.replace(self.base_config or DataConfig(), repo_id=self.repo_id)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -963,6 +966,29 @@ _CONFIGS = [
         num_train_steps=10,
         overwrite=True,
         exp_name="debug_pi05",
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_rmt_context_pytorch",
+        model=pi0_config.Pi0RMTContextConfig(
+            pi05=True,
+            paligemma_variant="dummy",
+            action_expert_variant="dummy",
+            action_horizon=16,
+            max_recur_steps=1,
+            mini_batch_size=4,
+            budget=8,
+            token_per_image=4,
+            memory_hidden_dim=64,
+            num_attn_heads=4,
+            num_kv_heads=1,
+            pytorch_compile_mode=None,
+        ),
+        data=FakeDataConfig(base_config=DataConfig(use_episode_stream=True)),
+        batch_size=2,
+        num_train_steps=10,
+        overwrite=True,
+        exp_name="rmt_debug",
         wandb_enabled=False,
     ),
     # RoboArena & PolaRiS configs.
