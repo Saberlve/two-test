@@ -99,7 +99,7 @@ class RepackTransform(DataTransformFn):
     def __call__(self, data: DataDict) -> DataDict:
         flat_item = flatten_dict(data)
         result = jax.tree.map(lambda k: flat_item[k], self.structure)
-        for key in ("episode_id", "episode_pos", "stream_id"):
+        for key in ("episode_id", "episode_pos", "stream_id", "image_features"):
             if key in data:
                 result[key] = data[key]
         return result

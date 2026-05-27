@@ -162,9 +162,13 @@ class PI0Pytorch(nn.Module):
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
         observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
+        image_features = None
+        if observation.image_features is not None:
+            image_features = [observation.image_features[key] for key in observation.images]
         return (
             list(observation.images.values()),
             list(observation.image_masks.values()),
+            image_features,
             observation.tokenized_prompt,
             observation.tokenized_prompt_mask,
             observation.state,
@@ -185,7 +189,7 @@ class PI0Pytorch(nn.Module):
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks
+        self, images, img_masks, lang_tokens, lang_masks, image_features=None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
@@ -195,12 +199,22 @@ class PI0Pytorch(nn.Module):
         att_masks = []
 
         # Process images
-        for img, img_mask in zip(images, img_masks, strict=True):
+        if image_features is None:
+            image_features = [None] * len(images)
+        if len(image_features) != len(images):
+            raise ValueError(f"image_features length ({len(image_features)}) must match images length ({len(images)})")
+
+        for img, img_mask, img_feature in zip(images, img_masks, image_features, strict=True):
 
             def image_embed_func(img):
                 return self.paligemma_with_expert.embed_image(img)
 
-            img_emb = self._apply_checkpoint(image_embed_func, img)
+            if img_feature is None:
+                img_emb = self._apply_checkpoint(image_embed_func, img)
+            else:
+                embed_tokens = self.paligemma_with_expert.paligemma.language_model.embed_tokens
+                target_dtype = embed_tokens.weight.dtype
+                img_emb = img_feature.detach().to(device=img.device, dtype=target_dtype)
 
             bsize, num_img_embs = img_emb.shape[:2]
 
@@ -316,7 +330,9 @@ class PI0Pytorch(nn.Module):
 
     def forward(self, observation, actions, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+        images, img_masks, image_features, lang_tokens, lang_masks, state = self._preprocess_observation(
+            observation, train=True
+        )
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -328,7 +344,9 @@ class PI0Pytorch(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, image_features
+        )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -381,9 +399,13 @@ class PI0Pytorch(nn.Module):
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+        images, img_masks, image_features, lang_tokens, lang_masks, state = self._preprocess_observation(
+            observation, train=False
+        )
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, image_features
+        )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 

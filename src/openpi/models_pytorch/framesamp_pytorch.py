@@ -15,6 +15,7 @@ class _CachedFrame:
     images: list[torch.Tensor]
     image_masks: list[torch.Tensor]
     state: torch.Tensor
+    image_features: list[torch.Tensor] | None = None
 
 
 class PI0FramesampContextPytorch(PI0Pytorch):
@@ -24,9 +25,7 @@ class PI0FramesampContextPytorch(PI0Pytorch):
         super().__init__(config)
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         self.context_window = int(config.context_window)
-        self.frame_sample_stride = int(config.frame_sample_stride)
         self.token_per_image = int(config.token_per_image)
-        self.context_budget = int(config.budget)
         self.context_state_proj = nn.Linear(config.action_dim, paligemma_config.width)
         self.context_pos_embedding = nn.Parameter(torch.zeros(self.context_window, paligemma_config.width))
         self.context_pad_token = nn.Parameter(torch.zeros(paligemma_config.width))
@@ -51,8 +50,11 @@ class PI0FramesampContextPytorch(PI0Pytorch):
         return stream_id.to(device), episode_id.to(device), episode_pos.to(device)
 
     def _sample_history(self, history: list[_CachedFrame]) -> list[_CachedFrame]:
-        sampled = history[::-self.frame_sample_stride][: self.context_window]
-        return list(reversed(sampled))
+        if len(history) <= self.context_window:
+            return list(history)
+
+        indices = torch.linspace(0, len(history) - 1, self.context_window, dtype=torch.long).tolist()
+        return [history[int(index)] for index in indices]
 
     def _build_context_tokens(
         self,
@@ -60,12 +62,14 @@ class PI0FramesampContextPytorch(PI0Pytorch):
         images: list[torch.Tensor],
         img_masks: list[torch.Tensor],
         state: torch.Tensor,
+        image_features: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = state.shape[0]
         device = state.device
         dtype = next(self.context_state_proj.parameters()).dtype
         stream_id, episode_id, episode_pos = self._metadata(observation, batch_size, device)
         width = self.context_pad_token.shape[-1]
+        context_token_count = self.context_window * max(1, len(images)) * self.token_per_image
 
         batch_embs = []
         batch_masks = []
@@ -80,26 +84,31 @@ class PI0FramesampContextPytorch(PI0Pytorch):
             row_tokens = []
             row_masks = []
             history = self._sample_history(self._history.get(sid, []))
-            left_pad_frames = self.context_window - len(history)
-            for hist_pos, cached in enumerate(history, start=left_pad_frames):
+            for hist_pos, cached in enumerate(history):
                 state_emb = self.context_state_proj(cached.state.to(device=device, dtype=dtype)[None])[0]
                 pos_emb = self.context_pos_embedding[hist_pos].to(device=device, dtype=state_emb.dtype)
-                for image, image_mask in zip(cached.images, cached.image_masks, strict=True):
-                    image = image.to(device=device)
-                    image_emb = self.paligemma_with_expert.embed_image(image[None])[0, : self.token_per_image]
+                cached_features = cached.image_features or [None] * len(cached.images)
+                for image, image_mask, image_feature in zip(
+                    cached.images, cached.image_masks, cached_features, strict=True
+                ):
+                    if image_feature is None:
+                        image = image.to(device=device)
+                        image_emb = self.paligemma_with_expert.embed_image(image[None])[0, : self.token_per_image]
+                    else:
+                        image_emb = image_feature.to(device=device, dtype=state_emb.dtype)[: self.token_per_image]
                     image_emb = image_emb + state_emb[None, :] + pos_emb[None, :]
                     row_tokens.append(image_emb)
                     valid = bool(image_mask.detach().cpu())
                     row_masks.append(torch.full((image_emb.shape[0],), valid, dtype=torch.bool, device=device))
 
             if row_tokens:
-                tokens = torch.cat(row_tokens, dim=0)[-self.context_budget :]
-                masks = torch.cat(row_masks, dim=0)[-self.context_budget :]
+                tokens = torch.cat(row_tokens, dim=0)[-context_token_count:]
+                masks = torch.cat(row_masks, dim=0)[-context_token_count:]
             else:
                 tokens = torch.empty((0, width), dtype=dtype, device=device)
                 masks = torch.empty((0,), dtype=torch.bool, device=device)
 
-            pad = self.context_budget - tokens.shape[0]
+            pad = context_token_count - tokens.shape[0]
             if pad > 0:
                 pad_tokens = self.context_pad_token.to(device=device, dtype=tokens.dtype)[None].expand(pad, -1)
                 tokens = torch.cat([pad_tokens, tokens], dim=0)
@@ -111,10 +120,22 @@ class PI0FramesampContextPytorch(PI0Pytorch):
             cached_images = [image[row].detach() for image in images]
             cached_masks = [mask[row].detach() for mask in img_masks]
             cached_state = state[row].detach()
+            cached_features = None
+            if image_features is not None:
+                if len(image_features) != len(images):
+                    raise ValueError(
+                        f"image_features length ({len(image_features)}) must match images length ({len(images)})"
+                    )
+                cached_features = [feature[row].detach() for feature in image_features]
             self._history.setdefault(sid, []).append(
-                _CachedFrame(episode_id=eid, images=cached_images, image_masks=cached_masks, state=cached_state)
+                _CachedFrame(
+                    episode_id=eid,
+                    images=cached_images,
+                    image_masks=cached_masks,
+                    state=cached_state,
+                    image_features=cached_features,
+                )
             )
-            self._history[sid] = self._history[sid][-self.context_window * self.frame_sample_stride :]
 
         context_embs = torch.stack(batch_embs, dim=0)
         context_pad_masks = torch.stack(batch_masks, dim=0)
@@ -122,12 +143,16 @@ class PI0FramesampContextPytorch(PI0Pytorch):
         return context_embs, context_pad_masks, context_att_masks
 
     def _preprocess_observation(self, observation, *, train=True):
-        images, img_masks, lang_tokens, lang_masks, state = super()._preprocess_observation(observation, train=train)
-        self._pending_context = self._build_context_tokens(observation, images, img_masks, state)
-        return images, img_masks, lang_tokens, lang_masks, state
+        images, img_masks, image_features, lang_tokens, lang_masks, state = super()._preprocess_observation(
+            observation, train=train
+        )
+        self._pending_context = self._build_context_tokens(observation, images, img_masks, state, image_features)
+        return images, img_masks, image_features, lang_tokens, lang_masks, state
 
-    def embed_prefix(self, images, img_masks, lang_tokens, lang_masks):
-        prefix_embs, prefix_pad_masks, prefix_att_masks = super().embed_prefix(images, img_masks, lang_tokens, lang_masks)
+    def embed_prefix(self, images, img_masks, lang_tokens, lang_masks, image_features=None):
+        prefix_embs, prefix_pad_masks, prefix_att_masks = super().embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, image_features
+        )
         if self._pending_context is None:
             return prefix_embs, prefix_pad_masks, prefix_att_masks
         context_embs, context_pad_masks, context_att_masks = self._pending_context

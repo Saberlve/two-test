@@ -122,17 +122,11 @@ class Pi0FramesampContextConfig(Pi0Config):
     """PyTorch-only PI0/PI05 config with frame-sampled prefix context."""
 
     context_window: int = 4
-    frame_sample_stride: int = 1
     token_per_image: int = 8
-    budget: int = 96
 
     def __post_init__(self):
         super().__post_init__()
         if self.context_window < 1:
             raise ValueError(f"context_window must be >= 1, got {self.context_window}")
-        if self.frame_sample_stride < 1:
-            raise ValueError(f"frame_sample_stride must be >= 1, got {self.frame_sample_stride}")
         if self.token_per_image < 1:
             raise ValueError(f"token_per_image must be >= 1, got {self.token_per_image}")
-        if self.budget < 1:
-            raise ValueError(f"budget must be >= 1, got {self.budget}")

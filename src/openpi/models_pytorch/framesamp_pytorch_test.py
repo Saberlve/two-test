@@ -17,10 +17,10 @@ def _make_model():
     model = object.__new__(PI0FramesampContextPytorch)
     torch.nn.Module.__init__(model)
     model.context_window = 3
-    model.frame_sample_stride = 2
     model.token_per_image = 2
-    model.context_budget = 6
     model.context_state_proj = torch.nn.Linear(4, 8)
+    torch.nn.init.zeros_(model.context_state_proj.weight)
+    torch.nn.init.zeros_(model.context_state_proj.bias)
     model.context_pos_embedding = torch.nn.Parameter(torch.zeros(3, 8))
     model.context_pad_token = torch.nn.Parameter(torch.zeros(8))
     model.paligemma_with_expert = _DummyPaliGemma()
@@ -55,7 +55,7 @@ def test_framesamp_context_left_pads_and_resets_on_new_episode():
     assert model._history_episode[0] == 8
 
 
-def test_framesamp_context_uses_stride_and_isolates_streams():
+def test_framesamp_context_uniformly_samples_full_history_and_isolates_streams():
     model = _make_model()
     masks = [torch.ones(1, dtype=torch.bool)]
     state = torch.zeros(1, 4)
@@ -64,8 +64,25 @@ def test_framesamp_context_uses_stride_and_isolates_streams():
         model._build_context_tokens(_obs(3, pos, stream_id=0), [image], masks, state)
 
     image = torch.full((1, 3, 8, 8), 5.0)
-    _, mask, _ = model._build_context_tokens(_obs(3, 5, stream_id=0), [image], masks, state)
+    context, mask, _ = model._build_context_tokens(_obs(3, 5, stream_id=0), [image], masks, state)
     assert mask.tolist() == [[True, True, True, True, True, True]]
+    assert context[0, :, 0].tolist() == [0.0, 8.0, 2.0, 10.0, 4.0, 12.0]
 
     _, other_mask, _ = model._build_context_tokens(_obs(3, 1, stream_id=1), [image], masks, state)
     assert other_mask.tolist() == [[False, False, False, False, False, False]]
+
+
+def test_framesamp_context_uses_precomputed_features_without_vision_forward():
+    model = _make_model()
+    masks = [torch.ones(1, dtype=torch.bool)]
+    state = torch.zeros(1, 4)
+    image = torch.zeros(1, 3, 8, 8)
+    image_features = [torch.ones(1, 5, 8)]
+
+    model._build_context_tokens(_obs(4, 0), [image], masks, state, image_features)
+    model.paligemma_with_expert.embed_image = lambda image: (_ for _ in ()).throw(AssertionError("unexpected"))
+
+    context, mask, _ = model._build_context_tokens(_obs(4, 1), [image], masks, state, image_features)
+
+    assert context.shape == (1, 6, 8)
+    assert mask.tolist() == [[False, False, False, False, True, True]]
