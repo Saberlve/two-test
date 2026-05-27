@@ -83,15 +83,18 @@ def _posemb_3d(positions: torch.Tensor, spatial_size: int, dim: int, dtype: torc
 
 
 class PI0FramesampContextPytorch(PI0Pytorch):
-    """PI0/PI05 PyTorch baseline with frame-sampled prefix context tokens."""
+    """PI0/PI05 PyTorch baseline with frame-sampled prefix context tokens.
+
+    Behavior matches RoboMME's `perceptual-framesamp-context`: the current frame
+    is appended to history before sampling, uniform `linspace` sampling, right
+    padding when history is shorter than `context_window`.
+    """
 
     def __init__(self, config):
         super().__init__(config)
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         self.context_window = int(config.context_window)
-        self.context_budget = None if config.context_budget is None else int(config.context_budget)
         self.context_image_keys = None if config.context_image_keys is None else tuple(config.context_image_keys)
-        self.context_use_robomme_encoder = bool(config.context_use_robomme_encoder)
         self.context_pos_dim = int(config.context_pos_dim)
         self.context_use_pos_emb = bool(config.context_use_pos_emb)
         self.context_use_state_emb = bool(config.context_use_state_emb)
@@ -100,25 +103,18 @@ class PI0FramesampContextPytorch(PI0Pytorch):
         self.context_width = paligemma_config.width
         self.context_pad_token = nn.Parameter(torch.zeros(paligemma_config.width))
 
-        if self.context_use_robomme_encoder:
-            encoder_input_dim = paligemma_config.width
-            if self.context_use_pos_emb:
-                self.context_pos_proj = nn.Linear(self.context_pos_dim, int(config.context_pos_hidden_dim))
-                encoder_input_dim += int(config.context_pos_hidden_dim)
-            else:
-                self.context_pos_proj = None
-            if self.context_use_state_emb:
-                self.context_state_proj = nn.Linear(config.action_dim, int(config.context_state_hidden_dim))
-                encoder_input_dim += int(config.context_state_hidden_dim)
-            else:
-                self.context_state_proj = None
-            self.context_encoder_static = nn.Linear(encoder_input_dim, paligemma_config.width)
-            self.context_pos_embedding = None
+        encoder_input_dim = paligemma_config.width
+        if self.context_use_pos_emb:
+            self.context_pos_proj = nn.Linear(self.context_pos_dim, int(config.context_pos_hidden_dim))
+            encoder_input_dim += int(config.context_pos_hidden_dim)
         else:
-            self.context_state_proj = nn.Linear(config.action_dim, paligemma_config.width)
-            self.context_pos_embedding = nn.Parameter(torch.zeros(self.context_window, paligemma_config.width))
             self.context_pos_proj = None
-            self.context_encoder_static = None
+        if self.context_use_state_emb:
+            self.context_state_proj = nn.Linear(config.action_dim, int(config.context_state_hidden_dim))
+            encoder_input_dim += int(config.context_state_hidden_dim)
+        else:
+            self.context_state_proj = None
+        self.context_encoder_static = nn.Linear(encoder_input_dim, paligemma_config.width)
 
         self._history: dict[int, list[_CachedFrame]] = {}
         self._history_episode: dict[int, int] = {}
@@ -140,31 +136,22 @@ class PI0FramesampContextPytorch(PI0Pytorch):
             episode_pos = torch.arange(batch_size, device=device, dtype=torch.long)
         return stream_id.to(device), episode_id.to(device), episode_pos.to(device)
 
-    def _sample_history(self, history: list[_CachedFrame], max_frames: int | None = None) -> list[_CachedFrame]:
-        max_frames = self.context_window if max_frames is None else max_frames
+    def _sample_history(self, history: list[_CachedFrame]) -> list[_CachedFrame]:
+        max_frames = self.context_window
         if len(history) <= max_frames:
             return list(history)
-
         indices = torch.linspace(0, len(history) - 1, max_frames, dtype=torch.long).tolist()
         return [history[int(index)] for index in indices]
 
     def _context_token_count(self, num_images: int) -> int:
-        if self.context_budget is not None:
-            return self.context_budget
         return self.context_window * max(1, num_images) * self.token_per_image
-
-    def _max_context_frames(self, num_images: int) -> int:
-        tokens_per_frame = max(1, num_images) * self.token_per_image
-        return max(1, self._context_token_count(num_images) // tokens_per_frame)
 
     def _embed_context_image(self, image: torch.Tensor, image_feature: torch.Tensor | None, dtype: torch.dtype) -> torch.Tensor:
         if image_feature is None:
             image_emb = self.paligemma_with_expert.embed_image(image[None])[0]
         else:
             image_emb = image_feature.to(device=image.device, dtype=dtype)
-        if self.context_use_robomme_encoder:
-            return _pool_tokens_to_size(image_emb, self.token_per_image, self.context_pool_type)
-        return image_emb[: self.token_per_image]
+        return _pool_tokens_to_size(image_emb, self.token_per_image, self.context_pool_type)
 
     def _encode_robomme_context(
         self,
@@ -172,15 +159,19 @@ class PI0FramesampContextPytorch(PI0Pytorch):
         state: torch.Tensor,
         episode_pos: int,
     ) -> torch.Tensor:
-        parts = [image_emb]
+        encoder_dtype = self.context_encoder_static.weight.dtype
+        parts = [image_emb.to(dtype=encoder_dtype)]
         if self.context_use_pos_emb:
             spatial_size = int(math.sqrt(self.token_per_image))
             pos = torch.tensor([episode_pos], device=image_emb.device, dtype=torch.long)
             pos_emb = _posemb_3d(pos, spatial_size, self.context_pos_dim, image_emb.dtype)[0]
+            pos_emb = pos_emb.to(dtype=self.context_pos_proj.weight.dtype)
             pos_emb = F.silu(self.context_pos_proj(pos_emb))
             parts.append(pos_emb)
         if self.context_use_state_emb:
-            state_emb = F.silu(self.context_state_proj(state.to(device=image_emb.device, dtype=image_emb.dtype)[None]))[0]
+            state_emb = F.silu(
+                self.context_state_proj(state.to(device=image_emb.device, dtype=self.context_state_proj.weight.dtype)[None])
+            )[0]
             parts.append(state_emb[None, :].expand(image_emb.shape[0], -1))
         return self.context_encoder_static(torch.cat(parts, dim=-1))
 
@@ -197,7 +188,6 @@ class PI0FramesampContextPytorch(PI0Pytorch):
         dtype = self.context_pad_token.dtype
         stream_id, episode_id, episode_pos = self._metadata(observation, batch_size, device)
         context_token_count = self._context_token_count(len(images))
-        max_frames = self._max_context_frames(len(images))
 
         batch_embs = []
         batch_masks = []
@@ -220,42 +210,35 @@ class PI0FramesampContextPytorch(PI0Pytorch):
                     )
                 cached_features = [feature[row].detach() for feature in image_features]
 
-            if self.context_use_robomme_encoder:
-                self._history.setdefault(sid, []).append(
-                    _CachedFrame(
-                        episode_id=eid,
-                        episode_pos=epos,
-                        images=cached_images,
-                        image_masks=cached_masks,
-                        state=cached_state,
-                        image_features=cached_features,
-                    )
+            self._history.setdefault(sid, []).append(
+                _CachedFrame(
+                    episode_id=eid,
+                    episode_pos=epos,
+                    images=cached_images,
+                    image_masks=cached_masks,
+                    state=cached_state,
+                    image_features=cached_features,
                 )
+            )
 
             row_tokens = []
             row_masks = []
-            history = self._sample_history(self._history.get(sid, []), max_frames=max_frames)
-            for hist_pos, cached in enumerate(history):
-                if not self.context_use_robomme_encoder:
-                    state_emb = self.context_state_proj(cached.state.to(device=device, dtype=dtype)[None])[0]
-                    pos_emb = self.context_pos_embedding[hist_pos].to(device=device, dtype=state_emb.dtype)
+            history = self._sample_history(self._history.get(sid, []))
+            for cached in history:
                 cached_features = cached.image_features or [None] * len(cached.images)
                 for image, image_mask, image_feature in zip(
                     cached.images, cached.image_masks, cached_features, strict=True
                 ):
                     image = image.to(device=device)
                     image_emb = self._embed_context_image(image, image_feature, dtype)
-                    if self.context_use_robomme_encoder:
-                        image_emb = self._encode_robomme_context(image_emb, cached.state, cached.episode_pos)
-                    else:
-                        image_emb = image_emb + state_emb[None, :] + pos_emb[None, :]
+                    image_emb = self._encode_robomme_context(image_emb, cached.state, cached.episode_pos)
                     row_tokens.append(image_emb)
                     valid = bool(image_mask.detach().cpu())
                     row_masks.append(torch.full((image_emb.shape[0],), valid, dtype=torch.bool, device=device))
 
             if row_tokens:
-                tokens = torch.cat(row_tokens, dim=0)[-context_token_count:]
-                masks = torch.cat(row_masks, dim=0)[-context_token_count:]
+                tokens = torch.cat(row_tokens, dim=0)[:context_token_count]
+                masks = torch.cat(row_masks, dim=0)[:context_token_count]
             else:
                 tokens = torch.empty((0, self.context_width), dtype=dtype, device=device)
                 masks = torch.empty((0,), dtype=torch.bool, device=device)
@@ -264,27 +247,11 @@ class PI0FramesampContextPytorch(PI0Pytorch):
             if pad > 0:
                 pad_tokens = self.context_pad_token.to(device=device, dtype=tokens.dtype)[None].expand(pad, -1)
                 pad_masks = torch.zeros((pad,), dtype=torch.bool, device=device)
-                if self.context_use_robomme_encoder:
-                    tokens = torch.cat([tokens, pad_tokens], dim=0)
-                    masks = torch.cat([masks, pad_masks], dim=0)
-                else:
-                    tokens = torch.cat([pad_tokens, tokens], dim=0)
-                    masks = torch.cat([pad_masks, masks], dim=0)
+                tokens = torch.cat([tokens, pad_tokens], dim=0)
+                masks = torch.cat([masks, pad_masks], dim=0)
 
             batch_embs.append(tokens)
             batch_masks.append(masks)
-
-            if not self.context_use_robomme_encoder:
-                self._history.setdefault(sid, []).append(
-                    _CachedFrame(
-                        episode_id=eid,
-                        episode_pos=epos,
-                        images=cached_images,
-                        image_masks=cached_masks,
-                        state=cached_state,
-                        image_features=cached_features,
-                    )
-                )
 
         context_embs = torch.stack(batch_embs, dim=0)
         context_pad_masks = torch.stack(batch_masks, dim=0)

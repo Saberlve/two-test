@@ -96,24 +96,31 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
 def setup_ddp():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     use_ddp = world_size > 1
+    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        torch.cuda.set_device(device)
+
     if use_ddp and not torch.distributed.is_initialized():
         backend = "nccl" if torch.cuda.is_available() else "gloo"
-        torch.distributed.init_process_group(backend=backend, init_method="env://")
+        init_kwargs = {"backend": backend, "init_method": "env://"}
+        if device.type == "cuda":
+            init_kwargs["device_id"] = device
+        torch.distributed.init_process_group(**init_kwargs)
 
         # Set up debugging environment variables for DDP issues
         if os.environ.get("TORCH_DISTRIBUTED_DEBUG") is None:
             os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
 
-    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    if torch.cuda.is_available():
-        torch.cuda.set_device(device)
     return use_ddp, local_rank, device
 
 
 def cleanup_ddp():
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        if torch.cuda.is_available():
+            torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
+        else:
+            torch.distributed.barrier()
         torch.distributed.destroy_process_group()
 
 
@@ -146,6 +153,25 @@ def get_model_parameters(model):
         if isinstance(model, torch.nn.parallel.DistributedDataParallel)
         else model.parameters()
     )
+
+
+def sync_trainable_parameters(model: torch.nn.Module, src: int = 0) -> None:
+    """Synchronize only trainable parameters before wrapping a large frozen model with DDP."""
+    if not dist.is_initialized():
+        return
+
+    synced_tensors = 0
+    synced_params = 0
+    with torch.no_grad():
+        for param in model.parameters():
+            if not param.requires_grad:
+                continue
+            dist.broadcast(param.detach(), src=src)
+            synced_tensors += 1
+            synced_params += param.numel()
+
+    if dist.get_rank() == src:
+        logging.info("Synchronized %s trainable tensors (%s parameters) before DDP", synced_tensors, f"{synced_params:,}")
 
 
 def _is_expected_context_missing_key(model, key: str) -> bool:
@@ -368,15 +394,21 @@ def train_loop(config: _config.TrainConfig):
         else:
             raise FileNotFoundError(f"Experiment checkpoint directory {exp_checkpoint_dir} does not exist for resume")
     elif config.overwrite and config.checkpoint_dir.exists():
-        shutil.rmtree(config.checkpoint_dir)
-        logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
+        if is_main:
+            shutil.rmtree(config.checkpoint_dir)
+            logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
+        if use_ddp:
+            dist.barrier()
 
     # Create checkpoint directory with experiment name
     if not resuming:
         # For new runs, create experiment-specific checkpoint directory
         exp_checkpoint_dir = config.checkpoint_dir
-        exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
+        if is_main:
+            exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
+        if use_ddp:
+            dist.barrier()
     else:
         # For resume, checkpoint_dir is already set to the experiment directory
         logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
@@ -398,7 +430,7 @@ def train_loop(config: _config.TrainConfig):
     loader, data_config = build_datasets(config)
 
     # Log sample images to wandb on first batch
-    if is_main and config.wandb_enabled and not resuming:
+    if is_main and config.wandb_enabled and not resuming and not use_ddp:
         # Create a separate data loader for sample batch to avoid consuming the main loader
         sample_data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=False)
         sample_batch = next(iter(sample_data_loader))
@@ -427,6 +459,8 @@ def train_loop(config: _config.TrainConfig):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         logging.info("Cleared sample batch and data loader from memory")
+    elif is_main and config.wandb_enabled and not resuming and use_ddp:
+        logging.info("Skipping wandb sample image logging under DDP to avoid rank-local collectives")
 
     # Build model
     if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
@@ -491,13 +525,18 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"LoRA applied: {trainable_count:,} trainable params, {frozen_count:,} frozen params")
 
     if use_ddp:
+        sync_trainable_parameters(model)
+        logging.info("Wrapping model with DDP")
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[device.index] if device.type == "cuda" else None,
-            find_unused_parameters=True,  # Disable for memory efficiency
+            find_unused_parameters=True,  # Required for conditional/context paths.
             gradient_as_bucket_view=True,  # Enable for memory efficiency
             static_graph=world_size >= 8,  # Enable for 8+ GPUs
+            broadcast_buffers=False,
+            init_sync=False,
         )
+        logging.info("DDP wrapping complete")
 
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
