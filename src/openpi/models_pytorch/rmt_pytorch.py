@@ -174,8 +174,16 @@ class PI0RMTContextPytorch(PI0Pytorch):
         images: list[torch.Tensor],
         img_masks: list[torch.Tensor],
         state: torch.Tensor,
+        image_features: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        image_embs = [self.paligemma_with_expert.embed_image(image) for image in images]
+        if image_features is None:
+            image_embs = [self.paligemma_with_expert.embed_image(image) for image in images]
+        else:
+            if len(image_features) != len(images):
+                raise ValueError(
+                    f"image_features length ({len(image_features)}) must match images length ({len(images)})"
+                )
+            image_embs = [feature.detach().to(device=state.device) for feature in image_features]
         batch_size = state.shape[0]
         device = state.device
         stream_id, episode_id, episode_pos = self._metadata(observation, batch_size, device)
@@ -211,12 +219,16 @@ class PI0RMTContextPytorch(PI0Pytorch):
         return context_tokens, context_pad_masks, context_att_masks
 
     def _preprocess_observation(self, observation, *, train=True):
-        images, img_masks, lang_tokens, lang_masks, state = super()._preprocess_observation(observation, train=train)
-        self._pending_context = self._build_rmt_context(observation, images, img_masks, state)
-        return images, img_masks, lang_tokens, lang_masks, state
+        images, img_masks, image_features, lang_tokens, lang_masks, state = super()._preprocess_observation(
+            observation, train=train
+        )
+        self._pending_context = self._build_rmt_context(observation, images, img_masks, state, image_features)
+        return images, img_masks, image_features, lang_tokens, lang_masks, state
 
-    def embed_prefix(self, images, img_masks, lang_tokens, lang_masks):
-        prefix_embs, prefix_pad_masks, prefix_att_masks = super().embed_prefix(images, img_masks, lang_tokens, lang_masks)
+    def embed_prefix(self, images, img_masks, lang_tokens, lang_masks, image_features=None):
+        prefix_embs, prefix_pad_masks, prefix_att_masks = super().embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, image_features
+        )
         if self._pending_context is None:
             return prefix_embs, prefix_pad_masks, prefix_att_masks
         context_embs, context_pad_masks, context_att_masks = self._pending_context

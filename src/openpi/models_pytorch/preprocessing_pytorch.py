@@ -164,6 +164,7 @@ def preprocess_observation_pytorch(
     return SimpleProcessedObservation(
         images=out_images,
         image_masks=out_masks,
+        image_features=observation.image_features,
         state=observation.state,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,

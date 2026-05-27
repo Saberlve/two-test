@@ -87,3 +87,22 @@ def test_rmt_context_resets_on_episode_start_and_isolates_streams():
 
     model._build_rmt_context(_obs(2, 1, stream_id=1), images, masks, torch.full((1, 4), 1.0))
     assert torch.allclose(model._memory_state_by_stream[1], torch.full((3, 8), 2.0))
+
+
+def test_rmt_context_uses_precomputed_features_without_vision_forward():
+    model = _make_context_model()
+    model.paligemma_with_expert.embed_image = lambda image: (_ for _ in ()).throw(AssertionError("unexpected"))
+    images = [torch.zeros(1, 3, 8, 8)]
+    masks = [torch.ones(1, dtype=torch.bool)]
+    image_features = [torch.ones(1, 5, 8)]
+
+    context, mask, _ = model._build_rmt_context(
+        _obs(2, 0, stream_id=0),
+        images,
+        masks,
+        torch.ones(1, 4),
+        image_features,
+    )
+
+    assert context.shape == (1, 3, 8)
+    assert mask.tolist() == [[True, True, True]]

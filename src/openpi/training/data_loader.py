@@ -3,6 +3,7 @@ from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
 import os
+import pathlib
 import sys
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
@@ -73,6 +74,94 @@ class _EpisodeStreamMeta:
     @property
     def num_frames(self) -> int:
         return self.end - self.start
+
+
+def resolve_vision_feature_episode_path(
+    vision_features_root: str | os.PathLike[str],
+    feature_id: str,
+    episode_id: int,
+) -> pathlib.Path:
+    """Return the canonical sidecar path for one episode's precomputed vision features."""
+    chunk_id = int(episode_id) // 1000
+    return (
+        pathlib.Path(vision_features_root)
+        / "vision_features"
+        / feature_id
+        / f"chunk-{chunk_id:03d}"
+        / f"episode_{int(episode_id):06d}.npz"
+    )
+
+
+class VisionFeatureSidecarDataset(Dataset):
+    """Attach precomputed image token embeddings from per-episode sidecar npz files."""
+
+    def __init__(
+        self,
+        dataset: Dataset[dict],
+        episode_ranges: Sequence[tuple[int, int]],
+        *,
+        vision_features_root: str | os.PathLike[str],
+        feature_id: str,
+    ):
+        self._dataset = dataset
+        self._episode_ranges = [(int(start), int(end)) for start, end in episode_ranges]
+        self._starts = np.asarray([start for start, _ in self._episode_ranges], dtype=np.int64)
+        self._ends = np.asarray([end for _, end in self._episode_ranges], dtype=np.int64)
+        self._vision_features_root = pathlib.Path(vision_features_root)
+        self._feature_id = str(feature_id)
+        self._cache: dict[int, dict[str, np.ndarray]] = {}
+        source = dataset
+        while isinstance(source, TransformedDataset):
+            source = source._dataset  # noqa: SLF001
+        if hasattr(source, "episode_data_index"):
+            self.episode_data_index = source.episode_data_index
+
+        if not self._episode_ranges:
+            raise ValueError("Cannot attach vision features without episode ranges.")
+
+        for episode_id in range(len(self._episode_ranges)):
+            path = resolve_vision_feature_episode_path(self._vision_features_root, self._feature_id, episode_id)
+            if not path.is_file():
+                raise FileNotFoundError(f"Missing precomputed vision feature sidecar: {path}")
+
+    def __getitem__(self, index: SupportsIndex) -> dict:
+        frame_index = int(index)
+        sample = dict(self._dataset[frame_index])
+        episode_id, episode_pos = self._locate_frame(frame_index)
+        sample["image_features"] = self._load_frame_features(episode_id, episode_pos)
+        return sample
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+    def _locate_frame(self, frame_index: int) -> tuple[int, int]:
+        episode_id = int(np.searchsorted(self._starts, frame_index, side="right") - 1)
+        if episode_id < 0 or frame_index >= int(self._ends[episode_id]):
+            raise IndexError(f"Frame index {frame_index} is outside known episode ranges.")
+        return episode_id, frame_index - int(self._starts[episode_id])
+
+    def _load_episode(self, episode_id: int) -> dict[str, np.ndarray]:
+        if episode_id not in self._cache:
+            path = resolve_vision_feature_episode_path(self._vision_features_root, self._feature_id, episode_id)
+            with np.load(path) as data:
+                arrays = {key: np.asarray(data[key]) for key in data.files if not key.startswith("__")}
+            if not arrays:
+                raise ValueError(f"Vision feature sidecar has no feature arrays: {path}")
+            self._cache[episode_id] = arrays
+        return self._cache[episode_id]
+
+    def _load_frame_features(self, episode_id: int, episode_pos: int) -> dict[str, np.ndarray]:
+        episode = self._load_episode(episode_id)
+        frame_features = {}
+        for key, values in episode.items():
+            if episode_pos >= values.shape[0]:
+                path = resolve_vision_feature_episode_path(self._vision_features_root, self._feature_id, episode_id)
+                raise IndexError(
+                    f"Vision feature sidecar {path} has {values.shape[0]} frames for {key}, "
+                    f"but episode position {episode_pos} was requested."
+                )
+            frame_features[key] = values[episode_pos]
+        return frame_features
 
 
 class EpisodeStreamIterableDataset(torch.utils.data.IterableDataset):
@@ -232,9 +321,10 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=data_config.dataset_root)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
+        root=data_config.dataset_root,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
@@ -242,6 +332,22 @@ def create_torch_dataset(
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+
+    if data_config.use_precomputed_vision_features:
+        feature_id = data_config.vision_feature_id
+        if not feature_id:
+            raise ValueError("vision_feature_id must be set when use_precomputed_vision_features=True.")
+        vision_features_root = data_config.vision_features_root or data_config.dataset_root
+        if not vision_features_root:
+            raise ValueError(
+                "vision_features_root or dataset_root must be set when use_precomputed_vision_features=True."
+            )
+        dataset = VisionFeatureSidecarDataset(
+            dataset,
+            _extract_episode_ranges(dataset),
+            vision_features_root=vision_features_root,
+            feature_id=feature_id,
+        )
 
     return dataset
 

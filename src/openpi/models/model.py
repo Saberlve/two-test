@@ -93,6 +93,8 @@ class Observation(Generic[ArrayT]):
     image_masks: dict[str, at.Bool[ArrayT, "*b"]]
     # Low-dimensional robot state.
     state: at.Float[ArrayT, "*b s"]
+    # Optional precomputed image token embeddings, with same keys as images.
+    image_features: dict[str, at.Float[ArrayT, "*b n d"]] | None = None
 
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
@@ -126,6 +128,7 @@ class Observation(Generic[ArrayT]):
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],
+            image_features=data.get("image_features"),
             state=data["state"],
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
@@ -141,6 +144,8 @@ class Observation(Generic[ArrayT]):
         result = dataclasses.asdict(self)
         result["image"] = result.pop("images")
         result["image_mask"] = result.pop("image_masks")
+        if result.get("image_features") is None:
+            result.pop("image_features", None)
         return result
 
 
@@ -208,6 +213,7 @@ def preprocess_observation(
     return Observation(
         images=out_images,
         image_masks=out_masks,
+        image_features=observation.image_features,
         state=observation.state,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,

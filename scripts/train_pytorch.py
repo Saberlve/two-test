@@ -41,6 +41,7 @@ import tqdm
 import wandb
 
 import openpi.models.pi0_config
+import openpi.models_pytorch.lora_pytorch as lora_utils
 import openpi.models_pytorch.pi0_pytorch
 import openpi.models_pytorch.rmt_pytorch
 import openpi.shared.normalize as _normalize
@@ -145,6 +146,43 @@ def get_model_parameters(model):
         if isinstance(model, torch.nn.parallel.DistributedDataParallel)
         else model.parameters()
     )
+
+
+def _is_expected_context_missing_key(model, key: str) -> bool:
+    model_to_check = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    if isinstance(model_to_check, openpi.models_pytorch.rmt_pytorch.PI0RMTContextPytorch):
+        return key.startswith("rmt_memory.")
+    return False
+
+
+def load_pytorch_weights(model, model_path: str, *, allow_context_missing: bool, device: torch.device) -> None:
+    missing, unexpected = safetensors.torch.load_model(
+        model,
+        model_path,
+        strict=not allow_context_missing,
+        device=str(device),
+    )
+    if not allow_context_missing:
+        return
+
+    expected_missing = sorted(key for key in missing if _is_expected_context_missing_key(model, key))
+    unexpected_missing = sorted(set(missing) - set(expected_missing))
+    unexpected = sorted(unexpected)
+
+    logging.info(
+        "Loaded PyTorch weights with strict=False: expected_missing_context=%s, unexpected_missing=%s, unexpected_keys=%s",
+        len(expected_missing),
+        len(unexpected_missing),
+        len(unexpected),
+    )
+    if expected_missing:
+        logging.info("Expected context-module missing keys: %s", expected_missing[:20])
+    if unexpected_missing:
+        logging.error("Unexpected missing keys while loading PyTorch weights: %s", unexpected_missing[:50])
+    if unexpected:
+        logging.error("Unexpected checkpoint keys while loading PyTorch weights: %s", unexpected[:50])
+    if unexpected_missing or unexpected:
+        raise RuntimeError("PyTorch checkpoint load had unexpected missing or unexpected keys")
 
 
 def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
@@ -433,6 +471,25 @@ def train_loop(config: _config.TrainConfig):
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
         logging.info("Enabled memory optimizations for 8+ GPU training")
 
+    # Load weights from weight_loader if specified (for fine-tuning)
+    if config.pytorch_weight_path is not None:
+        logging.info(f"Loading weights from: {config.pytorch_weight_path}")
+
+        model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
+        load_pytorch_weights(
+            model,
+            model_path,
+            allow_context_missing=isinstance(model, openpi.models_pytorch.rmt_pytorch.PI0RMTContextPytorch),
+            device=device,
+        )
+        logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
+
+    lora_enabled = config.lora_config is not None and config.lora_config.enabled
+    if lora_enabled:
+        logging.info("Applying LoRA adapters to model...")
+        frozen_count, trainable_count = lora_utils.apply_lora_to_pi0_pytorch(model, config.lora_config)
+        logging.info(f"LoRA applied: {trainable_count:,} trainable params, {frozen_count:,} frozen params")
+
     if use_ddp:
         model = torch.nn.parallel.DistributedDataParallel(
             model,
@@ -442,25 +499,23 @@ def train_loop(config: _config.TrainConfig):
             static_graph=world_size >= 8,  # Enable for 8+ GPUs
         )
 
-    # Load weights from weight_loader if specified (for fine-tuning)
-    if config.pytorch_weight_path is not None:
-        logging.info(f"Loading weights from: {config.pytorch_weight_path}")
-
-        model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
-        )
-        logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
-
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
     peak_lr = config.lr_schedule.peak_lr
     decay_steps = config.lr_schedule.decay_steps
     end_lr = config.lr_schedule.decay_lr
 
+    trainable_params = [param for param in get_model_parameters(model) if param.requires_grad]
+    logging.info(
+        "Optimizing %s tensors (%s parameters)%s",
+        len(trainable_params),
+        f"{sum(param.numel() for param in trainable_params):,}",
+        " in LoRA mode" if lora_enabled else "",
+    )
+
     # Create optimizer with config parameters
     optim = torch.optim.AdamW(
-        model.parameters(),
+        trainable_params,
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,

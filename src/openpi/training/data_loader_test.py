@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import jax
 import numpy as np
+import pytest
 
 from openpi.models import model as _model
 from openpi.models import pi0_config
@@ -126,6 +127,7 @@ def test_observation_from_dict_preserves_stream_metadata():
     data = {
         "image": {"base_0_rgb": np.zeros((2, 4, 4, 3), dtype=np.float32)},
         "image_mask": {"base_0_rgb": np.array([True, True])},
+        "image_features": {"base_0_rgb": np.zeros((2, 5, 8), dtype=np.float32)},
         "state": np.zeros((2, 1), dtype=np.float32),
         "episode_id": np.array([7, 8], dtype=np.int32),
         "episode_pos": np.array([3, 4], dtype=np.int32),
@@ -138,6 +140,37 @@ def test_observation_from_dict_preserves_stream_metadata():
     assert np.array_equal(processed.episode_id, data["episode_id"])
     assert np.array_equal(processed.episode_pos, data["episode_pos"])
     assert np.array_equal(processed.stream_id, data["stream_id"])
+    assert np.array_equal(processed.image_features["base_0_rgb"], data["image_features"]["base_0_rgb"])
+
+
+def test_vision_feature_sidecar_dataset_loads_frame_features(tmp_path):
+    dataset = _DummyFrameDataset([2])
+    feature_path = _data_loader.resolve_vision_feature_episode_path(tmp_path, "unit", 0)
+    feature_path.parent.mkdir(parents=True)
+    features = np.arange(2 * 3 * 4, dtype=np.float32).reshape(2, 3, 4)
+    np.savez_compressed(feature_path, base_0_rgb=features)
+
+    wrapped = _data_loader.VisionFeatureSidecarDataset(
+        dataset,
+        _data_loader._extract_episode_ranges(dataset),
+        vision_features_root=tmp_path,
+        feature_id="unit",
+    )
+
+    sample = wrapped[1]
+    assert np.array_equal(sample["image_features"]["base_0_rgb"], features[1])
+
+
+def test_vision_feature_sidecar_dataset_fails_on_missing_episode(tmp_path):
+    dataset = _DummyFrameDataset([1])
+
+    with pytest.raises(FileNotFoundError, match="Missing precomputed vision feature sidecar"):
+        _data_loader.VisionFeatureSidecarDataset(
+            dataset,
+            _data_loader._extract_episode_ranges(dataset),
+            vision_features_root=tmp_path,
+            feature_id="missing",
+        )
 
 
 def test_with_fake_dataset():

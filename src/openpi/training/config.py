@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import os
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -17,6 +18,7 @@ import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
+import openpi.models_pytorch.lora_pytorch as lora_pytorch
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
@@ -32,6 +34,14 @@ import openpi.transforms as _transforms
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
 Filter: TypeAlias = nnx.filterlib.Filter
+
+_MODELS_ROOT = os.environ.get("OPENPI_MODELS_ROOT", "/path/to/models")
+_RMBENCH_REPO_ID = os.environ.get("OPENPI_RMBENCH_REPO_ID", "rmbench_battery_swap_repo")
+_RMBENCH_DATASET_ROOT = os.environ.get(
+    "OPENPI_RMBENCH_DATASET_ROOT",
+    "/run/determined/NAS1/public/wangshuxun/rmbench_lerobot_data/rmbench_battery_swap_repo",
+)
+_VISION_FEATURE_ID = os.environ.get("OPENPI_VISION_FEATURE_ID", "pi05_base_pytorch")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -67,6 +77,14 @@ class DataConfig:
     repo_id: str | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
+    # Root directory for a local LeRobot dataset. If None, LeRobot resolves repo_id normally.
+    dataset_root: str | None = None
+    # Root directory that contains the vision_features sidecar directory. Defaults to dataset_root when enabled.
+    vision_features_root: str | None = None
+    # Feature version/name under vision_features/{vision_feature_id}.
+    vision_feature_id: str | None = None
+    # If true, load precomputed image token embeddings and fail fast when any sidecar is missing.
+    use_precomputed_vision_features: bool = False
     # Contains precomputed normalization stats. If None, normalization will not be performed.
     norm_stats: dict[str, _transforms.NormStats] | None = None
 
@@ -282,6 +300,37 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotRMBenchDataConfig(LeRobotAlohaDataConfig):
+    """RMBench LeRobot dataset config compatible with Aloha-style pi05 training."""
+
+    adapt_to_pi: bool = False
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default_factory=lambda: _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "cam_high": "observation.images.cam_high",
+                            "cam_left_wrist": "observation.images.cam_left_wrist",
+                            "cam_right_wrist": "observation.images.cam_right_wrist",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+    )
+    base_config: tyro.conf.Suppress[DataConfig | None] = dataclasses.field(
+        default_factory=lambda: DataConfig(
+            prompt_from_task=True,
+            dataset_root=_RMBENCH_DATASET_ROOT,
+        )
+    )
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotLiberoDataConfig(DataConfigFactory):
     """
     This config is used to configure transforms that are applied at various parts of the data pipeline.
@@ -484,6 +533,9 @@ class TrainConfig:
 
     # Optional path to a PyTorch checkpoint to load weights from.
     pytorch_weight_path: str | None = None
+
+    # LoRA training configuration for PyTorch. Set enabled=True to use LoRA fine-tuning.
+    lora_config: lora_pytorch.LoRATrainingConfig | None = None
 
     # Precision for PyTorch training.
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
@@ -932,6 +984,161 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=20_000,
+    ),
+    #
+    # RMBench configs.
+    #
+    TrainConfig(
+        name="pi05_rmbench",
+        project_name="openpi-rmbench",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+        ),
+        data=LeRobotRMBenchDataConfig(repo_id=_RMBENCH_REPO_ID),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        pytorch_weight_path=f"{_MODELS_ROOT}/pi05_base_pytorch",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_rmbench_rmt_context_pytorch",
+        project_name="openpi-rmbench",
+        model=pi0_config.Pi0RMTContextConfig(
+            pi05=True,
+            action_horizon=30,
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+            max_recur_steps=1,
+            mini_batch_size=8,
+            budget=8,
+            token_per_image=8,
+            memory_hidden_dim=256,
+            num_attn_heads=8,
+            num_kv_heads=1,
+            pytorch_compile_mode=None,
+        ),
+        data=LeRobotRMBenchDataConfig(
+            repo_id=_RMBENCH_REPO_ID,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                dataset_root=_RMBENCH_DATASET_ROOT,
+                use_episode_stream=True,
+            ),
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        pytorch_weight_path=f"{_MODELS_ROOT}/pi05_base_pytorch",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_rmbench_rmt_context_pytorch_precomputed",
+        project_name="openpi-rmbench",
+        model=pi0_config.Pi0RMTContextConfig(
+            pi05=True,
+            action_horizon=30,
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+            max_recur_steps=1,
+            mini_batch_size=8,
+            budget=8,
+            token_per_image=8,
+            memory_hidden_dim=256,
+            num_attn_heads=8,
+            num_kv_heads=1,
+            pytorch_compile_mode=None,
+        ),
+        data=LeRobotRMBenchDataConfig(
+            repo_id=_RMBENCH_REPO_ID,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                dataset_root=_RMBENCH_DATASET_ROOT,
+                use_episode_stream=True,
+                use_precomputed_vision_features=True,
+                vision_feature_id=_VISION_FEATURE_ID,
+            ),
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        pytorch_weight_path=f"{_MODELS_ROOT}/pi05_base_pytorch",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_rmbench_rmt_context_pytorch_precomputed_lora",
+        project_name="openpi-rmbench",
+        model=pi0_config.Pi0RMTContextConfig(
+            pi05=True,
+            action_horizon=30,
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+            max_recur_steps=1,
+            mini_batch_size=8,
+            budget=8,
+            token_per_image=8,
+            memory_hidden_dim=256,
+            num_attn_heads=8,
+            num_kv_heads=1,
+            pytorch_compile_mode=None,
+        ),
+        data=LeRobotRMBenchDataConfig(
+            repo_id=_RMBENCH_REPO_ID,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                dataset_root=_RMBENCH_DATASET_ROOT,
+                use_episode_stream=True,
+                use_precomputed_vision_features=True,
+                vision_feature_id=_VISION_FEATURE_ID,
+            ),
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        pytorch_weight_path=f"{_MODELS_ROOT}/pi05_base_pytorch",
+        num_train_steps=30_000,
+        lora_config=lora_pytorch.LoRATrainingConfig(
+            enabled=True,
+            attn_rank=16,
+            ffn_rank=16,
+            attn_alpha=16.0,
+            ffn_alpha=16.0,
+            apply_to="all",
+            train_non_lora_layers=True,
+            train_vision_encoder=False,
+            extra_trainable_modules=["rmt_memory"],
+        ),
     ),
     #
     # Debugging configs.
