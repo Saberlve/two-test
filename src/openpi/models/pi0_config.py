@@ -122,11 +122,28 @@ class Pi0FramesampContextConfig(Pi0Config):
     """PyTorch-only PI0/PI05 config with frame-sampled prefix context."""
 
     context_window: int = 4
+    context_budget: int | None = None
     token_per_image: int = 8
+    context_image_keys: tuple[str, ...] | None = None
+    context_use_robomme_encoder: bool = False
+    context_pos_dim: int = 768
+    context_pos_hidden_dim: int = 768
+    context_state_hidden_dim: int = 512
+    context_use_pos_emb: bool = True
+    context_use_state_emb: bool = False
+    context_pool_type: str = "mean"
 
     def __post_init__(self):
         super().__post_init__()
         if self.context_window < 1:
             raise ValueError(f"context_window must be >= 1, got {self.context_window}")
+        if self.context_budget is not None and self.context_budget < 1:
+            raise ValueError(f"context_budget must be >= 1, got {self.context_budget}")
         if self.token_per_image < 1:
             raise ValueError(f"token_per_image must be >= 1, got {self.token_per_image}")
+        if self.context_pos_dim < 1:
+            raise ValueError(f"context_pos_dim must be >= 1, got {self.context_pos_dim}")
+        if self.context_pos_dim % 6 != 0:
+            raise ValueError(f"context_pos_dim must be divisible by 6, got {self.context_pos_dim}")
+        if self.context_pool_type not in ("mean", "max"):
+            raise ValueError(f"context_pool_type must be 'mean' or 'max', got {self.context_pool_type!r}")
