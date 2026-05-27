@@ -1,4 +1,5 @@
 import dataclasses
+import math
 from typing import TYPE_CHECKING
 
 import flax.nnx as nnx
@@ -119,26 +120,38 @@ class Pi0Config(_model.BaseModelConfig):
 
 @dataclasses.dataclass(frozen=True)
 class Pi0RMTContextConfig(Pi0Config):
-    """PyTorch-only PI0/PI05 config with recurrent memory transformer context."""
+    """PyTorch-only PI0/PI05 config with RoboMME-aligned recurrent memory transformer context."""
 
-    max_recur_steps: int = 1
-    mini_batch_size: int = 8
+    max_recur_steps: int = 64
+    input_obs_horizon: int = 8
     budget: int = 8
-    token_per_image: int = 8
+    token_per_image: int = 64
+    num_views: int = 1
     memory_hidden_dim: int = 256
     num_attn_heads: int = 8
     num_kv_heads: int = 1
+    context_image_keys: tuple[str, ...] | None = None
+    context_pos_dim: int = 768
+    context_pos_hidden_dim: int = 768
+    context_state_hidden_dim: int = 512
+    context_pool_type: str = "mean"
+    use_pos_emb: bool = True
+    use_state_emb: bool = False
 
     def __post_init__(self):
         super().__post_init__()
         if self.max_recur_steps < 1:
             raise ValueError(f"max_recur_steps must be >= 1, got {self.max_recur_steps}")
-        if self.mini_batch_size < 1:
-            raise ValueError(f"mini_batch_size must be >= 1, got {self.mini_batch_size}")
+        if self.input_obs_horizon < 1:
+            raise ValueError(f"input_obs_horizon must be >= 1, got {self.input_obs_horizon}")
         if self.budget < 1:
             raise ValueError(f"budget must be >= 1, got {self.budget}")
         if self.token_per_image < 1:
             raise ValueError(f"token_per_image must be >= 1, got {self.token_per_image}")
+        if int(math.isqrt(self.token_per_image)) ** 2 != self.token_per_image:
+            raise ValueError(f"token_per_image must be a perfect square, got {self.token_per_image}")
+        if self.num_views < 1:
+            raise ValueError(f"num_views must be >= 1, got {self.num_views}")
         if self.memory_hidden_dim < 1:
             raise ValueError(f"memory_hidden_dim must be >= 1, got {self.memory_hidden_dim}")
         if self.num_attn_heads < 1 or self.memory_hidden_dim % self.num_attn_heads != 0:
@@ -147,3 +160,15 @@ class Pi0RMTContextConfig(Pi0Config):
             raise ValueError(f"num_kv_heads must be >= 1, got {self.num_kv_heads}")
         if self.num_attn_heads % self.num_kv_heads != 0:
             raise ValueError("num_kv_heads must divide num_attn_heads")
+        head_dim = self.memory_hidden_dim // self.num_attn_heads
+        if head_dim % 2 != 0:
+            raise ValueError(f"head_dim ({head_dim}) must be even for rotary embeddings")
+        if self.context_pos_dim % 6 != 0:
+            raise ValueError(f"context_pos_dim must be divisible by 6, got {self.context_pos_dim}")
+        spatial_size = int(math.isqrt(self.token_per_image))
+        if 16 % spatial_size != 0:
+            raise ValueError(
+                f"sqrt(token_per_image)={spatial_size} must divide 16 (RoboMME PosEmb3D constraint)"
+            )
+        if self.context_pool_type not in ("mean", "max"):
+            raise ValueError(f"context_pool_type must be 'mean' or 'max', got {self.context_pool_type!r}")
