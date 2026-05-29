@@ -11,6 +11,9 @@ from openpi.models import model as _model
 import openpi.models.gemma as _gemma
 from openpi.shared import array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
+import openpi.models_pytorch.lora_pytorch as lora_pytorch
+import safetensors
+from openpi.models_pytorch import rmt_pytorch
 
 if TYPE_CHECKING:
     from openpi.models.pi0 import Pi0
@@ -172,3 +175,18 @@ class Pi0RMTContextConfig(Pi0Config):
             )
         if self.context_pool_type not in ("mean", "max"):
             raise ValueError(f"context_pool_type must be 'mean' or 'max', got {self.context_pool_type!r}")
+
+    @override
+    def load_pytorch(self, train_config, weight_path: str):
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"train_config: {train_config}")
+        model = rmt_pytorch.PI0RMTContextPytorch(config=train_config.model)
+
+        # Apply LoRA if configured before loading weights.
+        if hasattr(train_config, "lora_config") and train_config.lora_config is not None:
+            lora_pytorch.apply_lora_to_pi0_pytorch(model, train_config.lora_config)
+            logger.info("Applied LoRA to PI0RMTContextPytorch model.")
+
+        safetensors.torch.load_model(model, weight_path)
+        return model

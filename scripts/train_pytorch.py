@@ -232,6 +232,17 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
         if config.wandb_enabled:
             wandb.log({"checkpoint_step": global_step}, step=global_step)
 
+        # Keep only the latest 2 checkpoints to avoid filling up disk
+        _keep_n = 2
+        _existing = sorted(
+            [int(d.name) for d in config.checkpoint_dir.iterdir() if d.is_dir() and d.name.isdigit()]
+        )
+        for _old_step in _existing[:-_keep_n]:
+            _old_dir = config.checkpoint_dir / str(_old_step)
+            import shutil as _shutil
+            _shutil.rmtree(_old_dir)
+            logging.info(f"Deleted old checkpoint: {_old_dir}")
+
 
 def load_checkpoint(model, optimizer, checkpoint_dir, device):
     """Load the latest checkpoint and return the global step."""

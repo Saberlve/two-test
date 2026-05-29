@@ -568,7 +568,7 @@ class TrainConfig:
     # How often (in steps) to log training metrics.
     log_interval: int = 100
     # How often (in steps) to save checkpoints.
-    save_interval: int = 1000
+    save_interval: int = 2000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
 
@@ -1119,6 +1119,59 @@ _CONFIGS = [
                 use_episode_stream=True,
                 use_precomputed_vision_features=True,
                 vision_feature_id=_VISION_FEATURE_ID,
+            ),
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        pytorch_weight_path=f"{_MODELS_ROOT}/pi05_base_pytorch",
+        num_train_steps=30_000,
+        lora_config=lora_pytorch.LoRATrainingConfig(
+            enabled=True,
+            attn_rank=16,
+            ffn_rank=16,
+            attn_alpha=16.0,
+            ffn_alpha=16.0,
+            apply_to="all",
+            train_non_lora_layers=True,
+            train_vision_encoder=False,
+            extra_trainable_modules=["rmt_memory"],
+        ),
+    ),
+    TrainConfig(
+        name="pi05_rmbench_swap_blocks_rmt_lora",
+        project_name="openpi-rmbench",
+        model=pi0_config.Pi0RMTContextConfig(
+            pi05=True,
+            action_horizon=30,
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+            max_recur_steps=10,
+            input_obs_horizon=30,
+            budget=256,
+            token_per_image=64,
+            num_views=1,
+            context_image_keys=("base_0_rgb",),
+            memory_hidden_dim=512,
+            num_attn_heads=8,
+            num_kv_heads=1,
+            pytorch_compile_mode=None,
+        ),
+        data=LeRobotRMBenchDataConfig(
+            repo_id="rmbench_swap_blocks_single_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                dataset_root="/dev/shm/wsx/dataset/rmbench_swap_blocks_single_repo",
+                use_episode_stream=True,
+                use_precomputed_vision_features=True,
+                vision_feature_id="pi05_base_pytorch",
             ),
         ),
         batch_size=64,
