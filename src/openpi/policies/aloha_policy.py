@@ -84,6 +84,16 @@ class AlohaInputs(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
+        # Forward episode/stream metadata and precomputed vision features when present.
+        # AlohaInputs rebuilds the inputs dict from scratch, so without this pass-through
+        # these keys are silently dropped before Observation.from_dict. Context-conditioned
+        # models (e.g. framesamp) then receive episode_pos/episode_id/stream_id = None and
+        # fall back to per-step defaults, which resets the history cache every step and
+        # leaves the model with no temporal context. Mirrors RepackTransform's pass-through.
+        for key in ("episode_id", "episode_pos", "stream_id", "image_features"):
+            if key in data:
+                inputs[key] = data[key]
+
         return inputs
 
 
