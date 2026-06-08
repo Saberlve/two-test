@@ -57,6 +57,13 @@ class WebsocketPolicyServer:
                 start_time = time.monotonic()
                 obs = msgpack_numpy.unpackb(await websocket.recv())
 
+                # In-band reset sentinel (sent by client.reset()): clear any stateful policy
+                # context (e.g. framesamp history) at episode boundaries and ack immediately.
+                if isinstance(obs, dict) and obs.get("__reset__"):
+                    self._policy.reset()
+                    await websocket.send(packer.pack({"__reset__": True}))
+                    continue
+
                 infer_time = time.monotonic()
                 action = self._policy.infer(obs)
                 infer_time = time.monotonic() - infer_time

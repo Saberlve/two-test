@@ -55,4 +55,10 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
 
     @override
     def reset(self) -> None:
-        pass
+        # Tell the server to clear any stateful policy context at an episode boundary. The
+        # server acks with a small message; recv() keeps the request/response lockstep so the
+        # ack is not mistaken for the next infer() response.
+        self._ws.send(self._packer.pack({"__reset__": True}))
+        response = self._ws.recv()
+        if isinstance(response, str):
+            raise RuntimeError(f"Error in inference server:\n{response}")

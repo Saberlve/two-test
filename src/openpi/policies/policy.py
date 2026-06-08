@@ -105,6 +105,16 @@ class Policy(BasePolicy):
         }
         return outputs
 
+    @override
+    def reset(self) -> None:
+        # Context-conditioned PyTorch models (e.g. framesamp) accumulate per-stream history
+        # across infer() calls. The eval loop must reset this at episode boundaries, otherwise
+        # one episode's memory bleeds into the next.
+        if self._is_pytorch_model:
+            reset_fn = getattr(self._model, "reset_context_cache", None)
+            if callable(reset_fn):
+                reset_fn()
+
     @property
     def metadata(self) -> dict[str, Any]:
         return self._metadata

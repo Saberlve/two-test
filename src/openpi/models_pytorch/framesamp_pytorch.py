@@ -118,11 +118,18 @@ class PI0FramesampContextPytorch(PI0Pytorch):
 
         self._history: dict[int, list[_CachedFrame]] = {}
         self._history_episode: dict[int, int] = {}
+        # Monotonic per-stream step counter used at inference when the eval client does not
+        # supply `episode_pos`. Without it, `episode_pos` would default to `arange(batch)` (i.e.
+        # 0 for batch_size=1) on every `infer()` call, making `epos == 0` perpetually true and
+        # resetting the history every step — the model would then run permanently in the
+        # degenerate "first frame, all padding" regime it was never optimized for at eval.
+        self._infer_pos: dict[int, int] = {}
         self._pending_context: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
     def reset_context_cache(self) -> None:
         self._history.clear()
         self._history_episode.clear()
+        self._infer_pos.clear()
 
     def _metadata(self, observation, batch_size: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         stream_id = observation.stream_id
@@ -130,11 +137,21 @@ class PI0FramesampContextPytorch(PI0Pytorch):
         episode_pos = observation.episode_pos
         if stream_id is None:
             stream_id = torch.arange(batch_size, device=device, dtype=torch.long)
+        stream_id = stream_id.to(device)
         if episode_id is None:
             episode_id = torch.full((batch_size,), -1, device=device, dtype=torch.long)
         if episode_pos is None:
-            episode_pos = torch.arange(batch_size, device=device, dtype=torch.long)
-        return stream_id.to(device), episode_id.to(device), episode_pos.to(device)
+            # Inference without per-frame metadata: advance a per-stream counter so history
+            # accumulates across calls. `reset_context_cache()` (called at episode boundaries)
+            # zeroes these so the next episode restarts at position 0 and triggers a reset.
+            pos_list = []
+            for row in range(batch_size):
+                sid = int(stream_id[row].detach().cpu())
+                pos = self._infer_pos.get(sid, 0)
+                pos_list.append(pos)
+                self._infer_pos[sid] = pos + 1
+            episode_pos = torch.tensor(pos_list, device=device, dtype=torch.long)
+        return stream_id, episode_id.to(device), episode_pos.to(device)
 
     def _sample_history(self, history: list[_CachedFrame]) -> list[_CachedFrame]:
         max_frames = self.context_window
@@ -199,16 +216,24 @@ class PI0FramesampContextPytorch(PI0Pytorch):
                 self._history[sid] = []
                 self._history_episode[sid] = eid
 
-            cached_images = [image[row].detach() for image in images]
-            cached_masks = [mask[row].detach() for mask in img_masks]
-            cached_state = state[row].detach()
+            # Cache history on CPU, not GPU. The per-stream history accumulates one
+            # frame per step until the episode boundary (~600 frames/episode), so
+            # keeping detached tensors on the CUDA device leaks GPU memory that grows
+            # the deeper we are into an episode (peak 15GB->75GB observed). Every read
+            # path below already relocates these to `device` (image.to(device), and
+            # state/feature .to(device=...) inside the encoders), so CPU storage is
+            # semantically identical and bounds GPU memory to the current batch +
+            # context_window materialized frames.
+            cached_images = [image[row].detach().cpu() for image in images]
+            cached_masks = [mask[row].detach().cpu() for mask in img_masks]
+            cached_state = state[row].detach().cpu()
             cached_features = None
             if image_features is not None:
                 if len(image_features) != len(images):
                     raise ValueError(
                         f"image_features length ({len(image_features)}) must match images length ({len(images)})"
                     )
-                cached_features = [feature[row].detach() for feature in image_features]
+                cached_features = [feature[row].detach().cpu() for feature in image_features]
 
             self._history.setdefault(sid, []).append(
                 _CachedFrame(

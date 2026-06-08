@@ -1,3 +1,4 @@
+import collections
 import dataclasses
 from collections.abc import Iterator, Sequence
 import logging
@@ -109,7 +110,12 @@ class VisionFeatureSidecarDataset(Dataset):
         self._ends = np.asarray([end for _, end in self._episode_ranges], dtype=np.int64)
         self._vision_features_root = pathlib.Path(vision_features_root)
         self._feature_id = str(feature_id)
-        self._cache: dict[int, dict[str, np.ndarray]] = {}
+        # Bounded LRU cache: each episode sidecar is ~1.8 GB, and episode-stream access is
+        # sequential, so we only need the current (and the spilling-over) episode resident.
+        # An unbounded cache (or a large cap) exhausts host RAM and the kernel OOM-kills the
+        # DataLoader worker after a few thousand steps.
+        self._cache: collections.OrderedDict[int, dict[str, np.ndarray]] = collections.OrderedDict()
+        self._cache_max = max(1, int(os.environ.get("OPENPI_VISION_FEATURE_CACHE_SIZE", "2")))
         source = dataset
         while isinstance(source, TransformedDataset):
             source = source._dataset  # noqa: SLF001
@@ -141,14 +147,19 @@ class VisionFeatureSidecarDataset(Dataset):
         return episode_id, frame_index - int(self._starts[episode_id])
 
     def _load_episode(self, episode_id: int) -> dict[str, np.ndarray]:
-        if episode_id not in self._cache:
-            path = resolve_vision_feature_episode_path(self._vision_features_root, self._feature_id, episode_id)
-            with np.load(path) as data:
-                arrays = {key: np.asarray(data[key]) for key in data.files if not key.startswith("__")}
-            if not arrays:
-                raise ValueError(f"Vision feature sidecar has no feature arrays: {path}")
-            self._cache[episode_id] = arrays
-        return self._cache[episode_id]
+        cached = self._cache.get(episode_id)
+        if cached is not None:
+            self._cache.move_to_end(episode_id)
+            return cached
+        path = resolve_vision_feature_episode_path(self._vision_features_root, self._feature_id, episode_id)
+        with np.load(path) as data:
+            arrays = {key: np.asarray(data[key]) for key in data.files if not key.startswith("__")}
+        if not arrays:
+            raise ValueError(f"Vision feature sidecar has no feature arrays: {path}")
+        self._cache[episode_id] = arrays
+        while len(self._cache) > self._cache_max:
+            self._cache.popitem(last=False)
+        return arrays
 
     def _load_frame_features(self, episode_id: int, episode_pos: int) -> dict[str, np.ndarray]:
         episode = self._load_episode(episode_id)

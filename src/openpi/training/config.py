@@ -569,7 +569,7 @@ class TrainConfig:
     # How often (in steps) to log training metrics.
     log_interval: int = 100
     # How often (in steps) to save checkpoints.
-    save_interval: int = 1000
+    save_interval: int = 2000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
 
@@ -1089,7 +1089,7 @@ _CONFIGS = [
             discrete_state_input=True,
             paligemma_variant="gemma_2b",
             action_expert_variant="gemma_300m",
-            context_window=10,
+            context_window=8,
             context_image_keys=("base_0_rgb",),
             token_per_image=16,
             pytorch_compile_mode=None,
@@ -1105,6 +1105,10 @@ _CONFIGS = [
             ),
         ),
         batch_size=64,
+        # Each precomputed vision-feature sidecar is ~1.8 GB; extra DataLoader workers each keep
+        # their own resident episode cache, multiplying host RAM until the kernel OOM-kills a
+        # worker. Episode-stream access is sequential and np.load is cheap, so use a single worker.
+        num_workers=1,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
             peak_lr=5e-5,

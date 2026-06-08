@@ -131,6 +131,27 @@ class Pi0FramesampContextConfig(Pi0Config):
     context_use_state_emb: bool = False
     context_pool_type: str = "mean"
 
+    def load_pytorch(self, train_config, weight_path: str):
+        """Build the framesamp subclass (and re-apply LoRA, if trained with it) before loading.
+
+        The base `load_pytorch` only ever instantiates a plain `PI0Pytorch` with no LoRA, so it
+        cannot load a framesamp checkpoint — its state dict carries `context_*` modules and, for
+        LoRA runs, `lora_a`/`lora_b` adapters. We mirror the training build order in
+        `scripts/train_pytorch.py` (construct subclass -> apply LoRA -> load weights) so the
+        module tree matches the saved keys exactly.
+        """
+        import safetensors.torch
+
+        import openpi.models_pytorch.framesamp_pytorch as framesamp_pytorch
+        import openpi.models_pytorch.lora_pytorch as lora_utils
+
+        model = framesamp_pytorch.PI0FramesampContextPytorch(self)
+        lora_config = getattr(train_config, "lora_config", None)
+        if lora_config is not None and lora_config.enabled:
+            lora_utils.apply_lora_to_pi0_pytorch(model, lora_config)
+        safetensors.torch.load_model(model, weight_path)
+        return model
+
     def __post_init__(self):
         super().__post_init__()
         if self.context_window < 1:
