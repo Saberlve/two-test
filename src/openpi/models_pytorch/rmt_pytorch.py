@@ -595,6 +595,16 @@ class PI0RMTContextPytorch(PI0Pytorch):
             return prefix_embs, prefix_pad_masks, prefix_att_masks
         context_embs, context_pad_masks, context_att_masks = self._pending_context
         self._pending_context = None
+        # Make the RMT memory tokens a read-only prefix, matching RoboMME's `history_pi0`
+        # (first VLM image token gets ar_mask=1). `make_att_2d_masks` builds attention from
+        # the cumsum of att_masks: a query attends to keys whose cumsum is <= its own. Memory
+        # tokens stay in block 0 (att_mask=0, bidirectional among themselves); forcing a
+        # boundary (att_mask=1) on the first prefix token puts all image/text tokens in
+        # block 1. The current observation can then attend back to memory, but memory cannot
+        # attend forward to the current observation. `.clone()` materializes the expanded
+        # prefix mask so the in-place write is safe.
+        prefix_att_masks = prefix_att_masks.clone()
+        prefix_att_masks[:, 0] = True
         return (
             torch.cat([context_embs.to(dtype=prefix_embs.dtype), prefix_embs], dim=1),
             torch.cat([context_pad_masks, prefix_pad_masks], dim=1),
