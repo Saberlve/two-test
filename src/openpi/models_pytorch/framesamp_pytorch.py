@@ -51,34 +51,71 @@ def _pool_tokens_to_size(tokens: torch.Tensor, target_size: int, pool_type: str)
 
 
 def _posemb_3d(positions: torch.Tensor, spatial_size: int, dim: int, dtype: torch.dtype) -> torch.Tensor:
-    """Torch equivalent of RoboMME's PosEmb3D for pooled 16x16 SigLIP tokens."""
+    """3D sinusoidal position encoding: temporal + 2D spatial (RoboMME's PosEmb3D).
+
+    Encodes each frame's position as (t, y, x) using sinusoidal embeddings with
+    different frequency bases for time and space. The output is concatenated as:
+    [sin(t), cos(t), sin(y), cos(y), sin(x), cos(x)].
+
+    Args:
+        positions: (batch,) integer timesteps (episode_pos).
+        spatial_size: Side length of the pooled spatial token grid. Must divide 16
+            because tokens are pooled from a 16x16 SigLIP feature map.
+        dim: Total embedding dimension. Must be divisible by 6 because the output
+            is split evenly across 6 sin/cos components.
+        dtype: Target dtype for the returned tensor.
+
+    Returns:
+        (batch, spatial_size^2, dim) position embeddings, where every spatial token
+        in the same frame shares the same temporal component but has a distinct
+        2D spatial component.
+    """
     if dim % 6 != 0:
         raise ValueError(f"context_pos_dim must be divisible by 6, got {dim}")
     if spatial_size < 1 or 16 % spatial_size != 0:
         raise ValueError(f"spatial_size must divide 16, got {spatial_size}")
 
     device = positions.device
+    # Each of the 6 components (sin_t, cos_t, sin_y, cos_y, sin_x, cos_x) gets
+    # an equal share of the embedding dimensions.
     width = dim // 6
+    # Frequency ladder: omega[k] = k / (width - 1), ranging from 0 to 1.
     omega = torch.arange(width, device=device, dtype=torch.float32) / (width - 1)
+    # Temporal frequencies decay slower (base 10_000) than spatial (base 1_000).
     temporal_omega = 1.0 / (10_000**omega)
     spatial_omega = 1.0 / (1_000**omega)
 
+    # ---- Temporal PE (shared by all spatial tokens in the same frame) ----
     pos = positions.to(dtype=torch.float32)
+    # (batch, 1) * (1, width) -> (batch, width)
     temporal = pos[:, None] * temporal_omega[None]
+    # (batch, 2*width): [sin(t), cos(t)]
     temporal_pe = torch.cat([torch.sin(temporal), torch.cos(temporal)], dim=-1)
+    # Broadcast temporal component to every spatial token: (batch, spatial_size^2, 2*width)
     temporal_pe = temporal_pe[:, None, :].expand(-1, spatial_size * spatial_size, -1)
 
+    # ---- Spatial PE (unique per token within the frame) ----
+    # Build a (spatial_size, spatial_size) grid of Y/X coordinates.
     y, x = torch.meshgrid(
         torch.arange(spatial_size, device=device, dtype=torch.float32),
         torch.arange(spatial_size, device=device, dtype=torch.float32),
         indexing="ij",
     )
+    # Map pooled-grid coordinates back to the original 16x16 token grid so that
+    # the position encoding reflects the actual image location. For example, when
+    # spatial_size=4, stride=4 and the 4x4 centers are at [2, 6, 10, 14].
     stride = 16 // spatial_size
     offset = stride / 2.0
+    # (spatial_size^2, width): each row is one spatial token's Y-encoded position.
     y = (stride * y.flatten() + offset)[:, None] * spatial_omega[None]
+    # (spatial_size^2, width): same for X.
     x = (stride * x.flatten() + offset)[:, None] * spatial_omega[None]
+    # (spatial_size^2, 4*width): [sin(y), cos(y), sin(x), cos(x)]
     spatial_pe = torch.cat([torch.sin(y), torch.cos(y), torch.sin(x), torch.cos(x)], dim=-1)
+    # Expand to batch dimension: (batch, spatial_size^2, 4*width)
     spatial_pe = spatial_pe[None].expand(positions.shape[0], -1, -1)
+
+    # Concatenate temporal and spatial: (batch, spatial_size^2, 6*width=dim)
     return torch.cat([temporal_pe, spatial_pe], dim=-1).to(dtype=dtype)
 
 
@@ -176,16 +213,33 @@ class PI0FramesampContextPytorch(PI0Pytorch):
         state: torch.Tensor,
         episode_pos: int,
     ) -> torch.Tensor:
+        """Fuse visual tokens with temporal position and optional state embeddings.
+
+        Each spatial token in ``image_emb`` receives the same state vector but a
+        distinct 3D position encoding (time + 2D spatial). The concatenated
+        features are projected back to ``self.context_width``.
+
+        Args:
+            image_emb: ``(token_per_image, image_dim)`` visual tokens for one image.
+            state: ``(state_dim,)`` robot state vector.
+            episode_pos: Integer timestep within the episode.
+
+        Returns:
+            ``(token_per_image, context_width)`` encoded context tokens.
+        """
         encoder_dtype = self.context_encoder_static.weight.dtype
         parts = [image_emb.to(dtype=encoder_dtype)]
         if self.context_use_pos_emb:
+            # Generate per-spatial-token 3D position embedding (time + 2D space).
             spatial_size = int(math.sqrt(self.token_per_image))
             pos = torch.tensor([episode_pos], device=image_emb.device, dtype=torch.long)
+            # _posemb_3d returns (batch=1, spatial_size^2, dim); [0] drops the batch dim.
             pos_emb = _posemb_3d(pos, spatial_size, self.context_pos_dim, image_emb.dtype)[0]
             pos_emb = pos_emb.to(dtype=self.context_pos_proj.weight.dtype)
             pos_emb = F.silu(self.context_pos_proj(pos_emb))
             parts.append(pos_emb)
         if self.context_use_state_emb:
+            # State is global to the frame; broadcast to every spatial token.
             state_emb = F.silu(
                 self.context_state_proj(state.to(device=image_emb.device, dtype=self.context_state_proj.weight.dtype)[None])
             )[0]
@@ -249,6 +303,8 @@ class PI0FramesampContextPytorch(PI0Pytorch):
             row_tokens = []
             row_masks = []
             history = self._sample_history(self._history.get(sid, []))
+            # Convert sampled history frames into context tokens.  
+            # Augmented with temporal position and optional state embeddings.
             for cached in history:
                 cached_features = cached.image_features or [None] * len(cached.images)
                 for image, image_mask, image_feature in zip(
@@ -313,6 +369,7 @@ class PI0FramesampContextPytorch(PI0Pytorch):
         image_features = None
         if observation.image_features is not None:
             image_features = [observation.image_features[key] for key in observation.images]
+        # Subset camera views for context encoding (e.g., only base camera, not wrists)
         context_images, context_masks, context_features = self._select_context_items(
             keys, images, img_masks, image_features
         )
@@ -336,6 +393,16 @@ class PI0FramesampContextPytorch(PI0Pytorch):
             return prefix_embs, prefix_pad_masks, prefix_att_masks
         context_embs, context_pad_masks, context_att_masks = self._pending_context
         self._pending_context = None
+        # Make the memory tokens a read-only prefix, matching RoboMME's `history_pi0`
+        # (first VLM image token gets ar_mask=1). `make_att_2d_masks` builds attention
+        # from the cumsum of att_masks: a query attends to keys whose cumsum is <= its
+        # own. Context tokens stay in block 0 (att_mask=0, bidirectional among
+        # themselves); forcing a boundary (att_mask=1) on the first prefix token puts
+        # all image/text tokens in block 1. The current observation can then attend
+        # back to memory, but memory cannot attend forward to the current observation.
+        # `.clone()` materializes the expanded prefix mask so the in-place write is safe.
+        prefix_att_masks = prefix_att_masks.clone()
+        prefix_att_masks[:, 0] = True
         return (
             torch.cat([context_embs.to(dtype=prefix_embs.dtype), prefix_embs], dim=1),
             torch.cat([context_pad_masks, prefix_pad_masks], dim=1),

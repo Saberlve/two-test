@@ -11,14 +11,21 @@
       "justMyCode": false,
       "env": {
         "PYTHONPATH": "${workspaceFolder}/src",
-        "CUDA_VISIBLE_DEVICES": "0"
+        "CUDA_VISIBLE_DEVICES": "0",
+        "OPENPI_CODE_ROOT": "${workspaceFolder}",
+        "OPENPI_MODELS_ROOT": "/run/determined/NAS1/public/HuggingFace/PhysicalIntelligence",
+        "OPENPI_RMBENCH_REPO_ID": "rmbench_swap_blocks_single_repo",
+        "OPENPI_RMBENCH_ASSET_ID": "rmbench_swap_blocks_single_repo",
+        "OPENPI_RMBENCH_DATASET_ROOT": "/run/determined/NAS1/public/wangshuxun/lerobot/rmbench_swap_blocks_single_repo",
+        "OPENPI_VISION_FEATURE_ID": "pi05_base_pytorch"
       },
       "args": [
-        "debug",
+        "pi05_rmbench_framesamp_context_pytorch_precomputed_lora",
         "--batch-size",
         "1",
         "--num-train-steps",
         "10",
+        "--no-wandb_enabled",
         "--exp-name",
         "debug",
         "--overwrite"

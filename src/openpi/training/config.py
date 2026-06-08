@@ -1089,7 +1089,7 @@ _CONFIGS = [
             discrete_state_input=True,
             paligemma_variant="gemma_2b",
             action_expert_variant="gemma_300m",
-            context_window=8,
+            context_window=16,
             context_image_keys=("base_0_rgb",),
             token_per_image=16,
             pytorch_compile_mode=None,
@@ -1108,7 +1108,7 @@ _CONFIGS = [
         # Each precomputed vision-feature sidecar is ~1.8 GB; extra DataLoader workers each keep
         # their own resident episode cache, multiplying host RAM until the kernel OOM-kills a
         # worker. Episode-stream access is sequential and np.load is cheap, so use a single worker.
-        num_workers=1,
+        num_workers=2,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
             peak_lr=5e-5,
